@@ -1,0 +1,5 @@
+{
+  "openai":     "sk-proj-REPLACE_WITH_YOUR_OPENAI_KEY",
+  "anthropic":  "sk-ant-api03-REPLACE_WITH_YOUR_ANTHROPIC_KEY",
+  "assemblyai": "REPLACE_WITH_YOUR_ASSEMBLYAI_KEY"
+}
