@@ -1,0 +1,21 @@
+# This file documents the EXACT columns each tab needs.  In Google Sheets,
+# create 5 separate tabs named: Users, Usage, Errors, Version, Pilot
+# Then paste the corresponding header row into row 1 of each tab.
+#
+# ─── Tab: Users ───
+name,username,password_sha256,department,active,created,last_seen
+Jacques du Preez,jacques,e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,Studio,TRUE,2026-04-30,
+#
+# ─── Tab: Usage ───
+ts,username,route,model,input_tokens,output_tokens,audio_secs,cost_usd,file_name
+#
+# ─── Tab: Errors ───
+ts,username,version,route,error_type,message,stack_truncated
+#
+# ─── Tab: Version ───
+current,download_url,sha256,release_notes,min_supported
+7.0,https://drive.google.com/uc?export=download&id=YOUR_FILE_ID,REPLACE_WITH_SHA256_OF_ZIP,Initial release of V7.0 pilot,7.0
+#
+# ─── Tab: Pilot ───
+kill_switch,key_passphrase
+FALSE,Pilot2026Spring!ChangeThisToSomethingLong

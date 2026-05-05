@@ -1,0 +1,13 @@
+# macOS junk
+.DS_Store
+**/__pycache__/
+*.pyc
+
+# NEVER commit real API keys — even though encrypted_keys.bin is AES-GCM
+# protected, no need to put it in git. Lives in releases only.
+keys/keys_plaintext.json
+keys/encrypted_keys.bin
+*.key
+
+# Build artefacts
+*.app.zip

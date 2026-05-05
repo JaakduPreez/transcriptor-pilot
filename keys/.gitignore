@@ -1,0 +1,4 @@
+# NEVER commit real API keys.
+keys_plaintext.json
+encrypted_keys.bin
+*.key
