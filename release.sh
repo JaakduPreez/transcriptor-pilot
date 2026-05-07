@@ -40,7 +40,7 @@ APPS_SCRIPT_URL=$(need_kc apps_script_url)
 
 # ── Non-secret config ───────────────────────────────────────────────────────
 GITHUB_REPO="JaakduPreez/transcriptor-pilot"
-APP_BASE_DIR="/Users/jacquesdupreez/Desktop/Transcriptor App/Current Working File"
+APP_BASE_DIR="/Users/jacquesdupreez/OneHope Dropbox/Jacques du Preez/[01] Jacques Dropbox/[06] Jacques' Apps/[Transcriptor]/Current Working File"
 
 # ── Args ────────────────────────────────────────────────────────────────────
 VER="${1:-}"; shift || true
