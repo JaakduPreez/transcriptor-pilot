@@ -70,22 +70,23 @@ Repeat for each pilot user. **Always change `CHANGE_ME` and re-run** for each us
 1. `cd` into this `keys/` folder.
 2. `cp keys_plaintext.example.json keys_plaintext.json`
 3. Edit `keys_plaintext.json` with your real OneHope master keys for OpenAI, Anthropic, and AssemblyAI.
-4. Make sure the `cryptography` package is installed in the venv used by V7.0:
+4. Make sure the `cryptography` package is installed in the venv used by the current app version (substitute `V7.X` below for the current version):
    ```
-   /Users/jacquesdupreez/Desktop/Transcriptor\ App/Current\ Working\ File/TranscriptorV7.0.app/Contents/Resources/venv/bin/pip install cryptography
+   APP_BASE="/Users/jacquesdupreez/OneHope Dropbox/Jacques du Preez/[01] Jacques Dropbox/[06] Jacques' Apps/[Transcriptor]/Current Working File"
+   "$APP_BASE/TranscriptorV7.1.app/Contents/Resources/venv/bin/pip" install cryptography
    ```
    (V6.5's venv already has it; the duplicate inherits it.)
 5. Run the encryptor (use the SAME passphrase you put into the Sheet's Pilot tab):
    ```
-   /Users/jacquesdupreez/Desktop/Transcriptor\ App/Current\ Working\ File/TranscriptorV7.0.app/Contents/Resources/venv/bin/python3 \
+   "$APP_BASE/TranscriptorV7.1.app/Contents/Resources/venv/bin/python3" \
      encrypt_keys.py \
      --in keys_plaintext.json \
-     --out "/Users/jacquesdupreez/Desktop/Transcriptor App/Current Working File/TranscriptorV7.0.app/Contents/Resources/encrypted_keys.bin" \
+     --out "$APP_BASE/TranscriptorV7.1.app/Contents/Resources/encrypted_keys.bin" \
      --passphrase "Pilot2026Spring!ChangeThisToSomethingLong"
    ```
 6. Verify the file landed:
    ```
-   ls -lh "/Users/jacquesdupreez/Desktop/Transcriptor App/Current Working File/TranscriptorV7.0.app/Contents/Resources/encrypted_keys.bin"
+   ls -lh "$APP_BASE/TranscriptorV7.1.app/Contents/Resources/encrypted_keys.bin"
    ```
 7. **Securely delete `keys_plaintext.json`** when done (or keep locally; never commit, never share).
 
