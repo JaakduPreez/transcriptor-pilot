@@ -1,4 +1,24 @@
 /**
+ * Transcriptor Pilot — Apps Script web app
+ *
+ * ⚠ WHEN EDITING THIS FILE: bump CODE_GS_VERSION below by one AND redeploy
+ *   (Deploy → Manage deployments → ✏️ → Version: New version → Deploy).
+ *   The admin dashboard shows this value so admins can verify what's actually
+ *   deployed without opening the Apps Script editor.
+ *
+ * Version history:
+ *   v1-v3 — initial pilot scaffolding (login, heartbeat, usage, errors, feedback)
+ *   v4    — V7.7: _usage_totals (per-user week/month/all-time aggregation)
+ *   v5    — V8.1: _active_users (public list for login dropdown), `today` field
+ *           in _usage_totals, session-based admin endpoints (users / errors /
+ *           dept_billing / sheet_url), MIGRATE_consolidate_test_users one-shot
+ *   v6    — V8.1.5: today_by_route + today_by_route_count in _usage_totals so the
+ *           cost popover can show a today-by-action breakdown (whisper / assemblyai /
+ *           ha_* / claude_pdf_parse) instead of the Orphan section
+ */
+const CODE_GS_VERSION = '6';
+
+/**
  * Transcriptor Pilot — Apps Script web app (v2)
  * ----------------------------------------------------------------------------
  * Deploy as:
@@ -164,6 +184,33 @@ function _login(body) {
   };
 }
 
+// V8.0.6: PUBLIC endpoint — returns just the active users (name + username +
+// department) so the desktop app's login dropdown can populate itself from the
+// Sheet instead of having usernames hard-coded into the bundle. Cached 60s.
+// Never returns password_sha256 or any private user fields.
+function _active_users(body) {
+  const cache = CacheService.getScriptCache();
+  const cached = cache.get('active_users_v1');
+  if (cached) {
+    try { return JSON.parse(cached); } catch (e) { /* fall through */ }
+  }
+  const rows = _rows(TAB.USERS);
+  const users = rows
+    .filter(u => {
+      const a = String(u.active || '').toUpperCase();
+      return a === 'TRUE' || a === 'YES';
+    })
+    .map(u => ({
+      name: String(u.name || u.username || '').trim(),
+      username: String(u.username || '').trim().toLowerCase(),
+      department: String(u.department || '').trim(),
+    }))
+    .filter(u => !!u.username);
+  const resp = { ok: true, users: users };
+  try { cache.put('active_users_v1', JSON.stringify(resp), 60); } catch (e) { /* ignore */ }
+  return resp;
+}
+
 function _heartbeat(body) {
   const sess = _getSession(body.session_token);
   if (!sess) return { error: 'no_session' };
@@ -196,6 +243,147 @@ function _usage(body) {
   return { ok: true };
 }
 
+// V7.7: aggregate this user's Usage rows by period. Validates session_token so each
+// user can only see their own totals. If the caller's department is ADMIN (case
+// insensitive), the response also includes "orphan" rows where username is blank
+// or doesn't match any active user — useful for spotting unattributed historical
+// usage.
+function _usage_totals(body) {
+  const sess = _getSession(body.session_token);
+  if (!sess) return { error: 'no_session' };
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(TAB.USAGE);
+  if (!sh) return { error: 'no_usage_tab' };
+  const data = sh.getDataRange().getValues();
+  if (data.length < 2) {
+    return { ok: true, username: sess.username, week: 0, month: 0, all_time: 0,
+             counts: { week: 0, month: 0, all_time: 0 }, orphan: null };
+  }
+  const headers = data[0].map(h => String(h));
+  const tsCol   = headers.indexOf('ts');
+  const userCol = headers.indexOf('username');
+  const costCol = headers.indexOf('cost_usd');
+  const routeCol = headers.indexOf('route');  // V8.1.5: for today_by_route breakdown
+  if (tsCol < 0 || userCol < 0 || costCol < 0) {
+    return { error: 'usage_tab_schema_mismatch', headers: headers };
+  }
+  // Window boundaries
+  const now = new Date();
+  const dayStart   = new Date(now.getFullYear(), now.getMonth(), now.getDate());  // V8.0.5: today
+  const weekAgo    = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+
+  // Resolve admin flag from the calling user's department
+  const userInfo = _getUserByUsername(sess.username) || {};
+  const isAdmin = String(userInfo.department || '').toUpperCase() === 'ADMIN';
+
+  // Build set of known usernames so we can spot orphans
+  const knownUsernames = new Set();
+  if (isAdmin) {
+    const usersSh = ss.getSheetByName(TAB.USERS);
+    if (usersSh) {
+      const u = usersSh.getDataRange().getValues();
+      if (u.length > 1) {
+        const uHeaders = u[0].map(String);
+        const uCol = uHeaders.indexOf('username');
+        if (uCol >= 0) for (let i = 1; i < u.length; i++) {
+          const name = String(u[i][uCol] || '').trim();
+          if (name) knownUsernames.add(name);
+        }
+      }
+    }
+  }
+
+  let today = 0, week = 0, month = 0, all_time = 0;
+  let cToday = 0, cWeek = 0, cMonth = 0, cAll = 0;
+  let oToday = 0, oWeek = 0, oMonth = 0, oAll = 0;
+  let cOToday = 0, cOWeek = 0, cOMonth = 0, cOAll = 0;
+  // V8.1.5: today's cost broken down by route (whisper / assemblyai / ha_* / claude_pdf_parse)
+  const today_by_route = {};
+  const today_by_route_count = {};
+
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const rowTsRaw = row[tsCol];
+    const rowUser = String(row[userCol] || '').trim();
+    const rowCost = Number(row[costCol] || 0);
+    if (!isFinite(rowCost) || rowCost <= 0) continue;
+    let rowTs;
+    if (rowTsRaw instanceof Date) rowTs = rowTsRaw;
+    else { rowTs = new Date(String(rowTsRaw)); if (isNaN(rowTs.getTime())) continue; }
+
+    // Case-insensitive match so historical rows with different casing still aggregate.
+    const sameUser = String(rowUser).toLowerCase() === String(sess.username).toLowerCase();
+    if (sameUser) {
+      all_time += rowCost; cAll++;
+      if (rowTs >= monthStart) { month += rowCost; cMonth++; }
+      if (rowTs >= weekAgo)    { week  += rowCost; cWeek++; }
+      if (rowTs >= dayStart)   {
+        today += rowCost; cToday++;
+        // V8.1.5: route-level breakdown for today
+        if (routeCol >= 0) {
+          const route = String(row[routeCol] || 'unknown').trim() || 'unknown';
+          today_by_route[route] = (today_by_route[route] || 0) + rowCost;
+          today_by_route_count[route] = (today_by_route_count[route] || 0) + 1;
+        }
+      }
+    } else if (isAdmin && (!rowUser || !knownUsernames.has(rowUser))) {
+      oAll += rowCost; cOAll++;
+      if (rowTs >= monthStart) { oMonth += rowCost; cOMonth++; }
+      if (rowTs >= weekAgo)    { oWeek  += rowCost; cOWeek++; }
+      if (rowTs >= dayStart)   { oToday += rowCost; cOToday++; }
+    }
+  }
+
+  // V8.1.5: round today_by_route values to 6 dp for transport
+  const today_by_route_rounded = {};
+  Object.keys(today_by_route).forEach(k => { today_by_route_rounded[k] = Math.round(today_by_route[k] * 1e6) / 1e6; });
+  const resp = {
+    ok: true,
+    username: sess.username,
+    is_admin: isAdmin,
+    today: Math.round(today * 1e6) / 1e6,
+    week: Math.round(week * 1e6) / 1e6,
+    month: Math.round(month * 1e6) / 1e6,
+    all_time: Math.round(all_time * 1e6) / 1e6,
+    counts: { today: cToday, week: cWeek, month: cMonth, all_time: cAll },
+    today_by_route: today_by_route_rounded,
+    today_by_route_count: today_by_route_count,
+    now: now.toISOString(),
+  };
+  if (isAdmin) {
+    resp.orphan = {
+      today: Math.round(oToday * 1e6) / 1e6,
+      week: Math.round(oWeek * 1e6) / 1e6,
+      month: Math.round(oMonth * 1e6) / 1e6,
+      all_time: Math.round(oAll * 1e6) / 1e6,
+      counts: { today: cOToday, week: cOWeek, month: cOMonth, all_time: cOAll },
+    };
+  }
+  return resp;
+}
+
+// V7.7 helper: look up a row in the Users tab by username (returns the row as an object).
+function _getUserByUsername(username) {
+  if (!username) return null;
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(TAB.USERS);
+  if (!sh) return null;
+  const data = sh.getDataRange().getValues();
+  if (data.length < 2) return null;
+  const headers = data[0].map(String);
+  const userCol = headers.indexOf('username');
+  if (userCol < 0) return null;
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][userCol] || '').trim() === username) {
+      const obj = {};
+      for (let c = 0; c < headers.length; c++) obj[headers[c]] = data[i][c];
+      return obj;
+    }
+  }
+  return null;
+}
+
 function _error(body) {
   // Errors don't require a valid session — we want to capture pre-login errors too
   const username = (_getSession(body.session_token) || {}).username || '(anon)';
@@ -215,11 +403,12 @@ function _version() {
   const rows = _rows(TAB.VERSION);
   const v = rows[0] || {};
   return {
-    current:        String(v.current || '0'),
-    download_url:   String(v.download_url || ''),
-    sha256:         String(v.sha256 || ''),
-    release_notes:  String(v.release_notes || ''),
-    min_supported:  String(v.min_supported || '0'),
+    current:           String(v.current || '0'),
+    download_url:      String(v.download_url || ''),
+    sha256:            String(v.sha256 || ''),
+    release_notes:     String(v.release_notes || ''),
+    min_supported:     String(v.min_supported || '0'),
+    code_gs_version:   CODE_GS_VERSION,  // V8.1: surface Apps Script source version
   };
 }
 
@@ -384,12 +573,20 @@ function doPost(e) {
   const path = (e.parameter || {}).path || body.path || '';
   let result;
   switch (path) {
-    case 'login':     result = _login(body);     break;
-    case 'heartbeat': result = _heartbeat(body); break;
-    case 'usage':     result = _usage(body);     break;
-    case 'error':     result = _error(body);     break;
-    case 'version':   result = _version();       break;
-    case 'feedback':  result = _feedback(body);  break;
+    case 'login':       result = _login(body);     break;
+    case 'active_users':result = _active_users(body); break;  // V8.0.6: public list for the login dropdown
+    case 'heartbeat':   result = _heartbeat(body); break;
+    // V8.0.7: session-based admin endpoints (no admin_token needed — caller must be a
+    // logged-in user with department=ADMIN). Used by the in-app admin drawer.
+    case 'admin/session_users':       result = _admin_session_users(body); break;
+    case 'admin/session_errors':      result = _admin_session_errors(body); break;
+    case 'admin/session_dept_billing':result = _admin_session_dept_billing(body); break;
+    case 'admin/session_sheet_url':   result = _admin_session_sheet_url(body); break;
+    case 'usage':       result = _usage(body);     break;
+    case 'usage/totals':result = _usage_totals(body); break;  // V7.7
+    case 'error':       result = _error(body);     break;
+    case 'version':     result = _version();       break;
+    case 'feedback':    result = _feedback(body);  break;
     // Admin endpoints — all require admin_token in the JSON body
     case 'admin/add_user':         result = _admin_add_user(body);        break;
     case 'admin/remove_user':      result = _admin_remove_user(body);     break;
@@ -409,6 +606,193 @@ function _json(obj, status) {
   // detect errors via the `error` field in the JSON body instead.
   return ContentService.createTextOutput(JSON.stringify(obj))
     .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ── V8.0.7: SESSION-BASED ADMIN ENDPOINTS ──────────────────────────────────
+// These endpoints let an authenticated user with department=ADMIN pull
+// admin-only data through the desktop app's in-app drawer, without ever
+// exposing the admin_token (which stays on the release machine only).
+
+function _isAdminSession(token) {
+  const sess = _getSession(token);
+  if (!sess) return null;
+  const u = _getUserByUsername(sess.username);
+  if (!u) return null;
+  const isAdmin = String(u.department || '').toUpperCase() === 'ADMIN';
+  return isAdmin ? sess : null;
+}
+
+function _admin_session_users(body) {
+  if (!_isAdminSession(body.session_token)) return { error: 'not_admin' };
+  // Include the hash so admin can audit / verify cells. Never exposed to non-admins.
+  return {
+    ok: true,
+    users: _rows(TAB.USERS).map(u => ({
+      name:             String(u.name || ''),
+      username:         String(u.username || ''),
+      password_sha256:  String(u.password_sha256 || ''),
+      department:       String(u.department || ''),
+      active:           String(u.active || ''),
+      created:          String(u.created || ''),
+      last_seen:        String(u.last_seen || ''),
+    })),
+  };
+}
+
+function _admin_session_errors(body) {
+  if (!_isAdminSession(body.session_token)) return { error: 'not_admin' };
+  const since = body.since_iso ? new Date(body.since_iso).getTime() : 0;
+  const limit = Math.min(Number(body.limit || 200), 500);
+  const all = _rows(TAB.ERRORS).filter(r => {
+    if (!since) return true;
+    const t = r.ts ? new Date(r.ts).getTime() : 0;
+    return t >= since;
+  });
+  // Newest first, cap at limit
+  all.sort((a, b) => {
+    const ta = a.ts ? new Date(a.ts).getTime() : 0;
+    const tb = b.ts ? new Date(b.ts).getTime() : 0;
+    return tb - ta;
+  });
+  return { ok: true, errors: all.slice(0, limit), total_count: all.length };
+}
+
+function _admin_session_dept_billing(body) {
+  if (!_isAdminSession(body.session_token)) return { error: 'not_admin' };
+  const users = _rows(TAB.USERS);
+  const userDept = {}; const userName = {};
+  users.forEach(u => {
+    const un = String(u.username || '').toLowerCase().trim();
+    if (!un) return;
+    userDept[un] = String(u.department || 'OTHER').toUpperCase() || 'OTHER';
+    userName[un] = String(u.name || u.username || '');
+  });
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(TAB.USAGE);
+  if (!sh) return { ok: true, by_dept: {} };
+  const data = sh.getDataRange().getValues();
+  if (data.length < 2) return { ok: true, by_dept: {} };
+  const headers = data[0].map(String);
+  const tsCol = headers.indexOf('ts');
+  const userCol = headers.indexOf('username');
+  const costCol = headers.indexOf('cost_usd');
+  if (tsCol < 0 || userCol < 0 || costCol < 0) return { error: 'schema_mismatch', headers: headers };
+
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const last30dAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+  const last7dAgo  = new Date(now.getTime() -  7 * 24 * 60 * 60 * 1000);
+  const dayStart   = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+  const byDept = {};
+  const ensureDept = (d) => byDept[d] || (byDept[d] = {
+    total: 0, today: 0, last_7d: 0, this_month: 0, last_30d: 0,
+    row_count: 0, by_user: {}
+  });
+
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const c = Number(row[costCol] || 0);
+    if (!isFinite(c) || c <= 0) continue;
+    let t;
+    const tsRaw = row[tsCol];
+    if (tsRaw instanceof Date) t = tsRaw;
+    else { t = new Date(String(tsRaw)); if (isNaN(t.getTime())) t = null; }
+    const un = String(row[userCol] || '').toLowerCase().trim();
+    const dept = userDept[un] || 'ORPHAN';
+    const bucket = ensureDept(dept);
+    bucket.total += c; bucket.row_count++;
+    if (t) {
+      if (t >= monthStart)  bucket.this_month += c;
+      if (t >= last30dAgo)  bucket.last_30d   += c;
+      if (t >= last7dAgo)   bucket.last_7d    += c;
+      if (t >= dayStart)    bucket.today      += c;
+    }
+    if (!bucket.by_user[un]) bucket.by_user[un] = { name: userName[un] || un, total: 0, this_month: 0, last_30d: 0, row_count: 0 };
+    const u = bucket.by_user[un];
+    u.total += c; u.row_count++;
+    if (t) {
+      if (t >= monthStart) u.this_month += c;
+      if (t >= last30dAgo) u.last_30d   += c;
+    }
+  }
+  // Round all values to 6dp for transport
+  const r6 = (x) => Math.round(x * 1e6) / 1e6;
+  Object.keys(byDept).forEach(d => {
+    const b = byDept[d];
+    b.total = r6(b.total); b.today = r6(b.today); b.last_7d = r6(b.last_7d);
+    b.this_month = r6(b.this_month); b.last_30d = r6(b.last_30d);
+    Object.keys(b.by_user).forEach(un => {
+      const u = b.by_user[un];
+      u.total = r6(u.total); u.this_month = r6(u.this_month); u.last_30d = r6(u.last_30d);
+    });
+  });
+  return { ok: true, now: now.toISOString(), by_dept: byDept };
+}
+
+function _admin_session_sheet_url(body) {
+  if (!_isAdminSession(body.session_token)) return { error: 'not_admin' };
+  return {
+    ok: true,
+    url: SpreadsheetApp.getActiveSpreadsheet().getUrl(),
+    code_gs_version: CODE_GS_VERSION,  // V8.1: so the admin drawer shows what's deployed
+  };
+}
+
+// ── ONE-TIME MIGRATION (V8.0.5) ─────────────────────────────────────────────
+// Consolidate "Studio Test" + "Jon Test" usage rows into Jacques (admin), then
+// delete those two user rows. Run ONCE from the Apps Script editor:
+//   1. Open this Code.gs in script.google.com
+//   2. In the function dropdown, select `MIGRATE_consolidate_test_users`
+//   3. Click Run.  View → Logs shows the summary.
+// Safe to re-run — idempotent (after the first run, the from-users no longer
+// exist so no rows match).
+function MIGRATE_consolidate_test_users() {
+  // Names we'll match against the Users tab + Usage rows (case- and separator-insensitive).
+  const fromUsernames = ['studiotest', 'jontest', 'studio_test', 'jon_test'];
+  // Username of the admin we want to merge INTO. Adjust if your admin row uses
+  // a different value in the Users.username column.
+  const into = 'jacques_admin';
+  const norm = s => String(s || '').toLowerCase().replace(/[\s_-]+/g, '');
+  const fromSet = new Set(fromUsernames.map(norm));
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // 1. Reassign Usage rows
+  const usageSh = ss.getSheetByName(TAB.USAGE);
+  if (!usageSh) throw new Error('Usage tab missing');
+  const data = usageSh.getDataRange().getValues();
+  if (data.length < 2) { Logger.log('No usage rows to migrate.'); return { ok: true, reassigned: 0, removed: [] }; }
+  const headers = data[0].map(String);
+  const userCol = headers.indexOf('username');
+  if (userCol < 0) throw new Error('Usage.username column not found');
+  let reassigned = 0;
+  for (let r = 1; r < data.length; r++) {
+    if (fromSet.has(norm(data[r][userCol]))) {
+      usageSh.getRange(r + 1, userCol + 1).setValue(into);
+      reassigned++;
+    }
+  }
+
+  // 2. Delete the from-user rows in Users tab (bottom-up so deleteRow indexes stay valid)
+  const usersSh = ss.getSheetByName(TAB.USERS);
+  if (!usersSh) throw new Error('Users tab missing');
+  const udata = usersSh.getDataRange().getValues();
+  const uHeaders = udata[0].map(String);
+  const uCol = uHeaders.indexOf('username');
+  if (uCol < 0) throw new Error('Users.username column not found');
+  const removed = [];
+  for (let r = udata.length - 1; r >= 1; r--) {
+    if (fromSet.has(norm(udata[r][uCol]))) {
+      removed.push(String(udata[r][uCol]));
+      usersSh.deleteRow(r + 1);
+    }
+  }
+
+  const summary = `Reassigned ${reassigned} Usage row(s) into "${into}". Removed user row(s): ${removed.length ? removed.join(', ') : '(none)'}.`;
+  Logger.log(summary);
+  return { ok: true, reassigned, removed, into };
 }
 
 // ── Helper: hash a password (run from the script editor by you, the admin) ──
